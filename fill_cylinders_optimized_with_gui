@@ -1,0 +1,612 @@
+# fill_cylinders_optimized_with_gui.FCMacro (concave-safe containment, final boolean check, STL+STEP export)
+import FreeCAD, Part, Mesh, random, math, os, time, sys
+from FreeCAD import Vector
+
+# Qt import (works in FreeCAD GUI)
+try:
+    from PySide import QtGui, QtCore
+except Exception:
+    try:
+        from PySide2 import QtWidgets as QtGui, QtCore
+    except Exception:
+        QtGui = None
+        QtCore = None
+
+# Try importing GUI control for update suppression
+try:
+    import FreeCADGui
+except Exception:
+    FreeCADGui = None
+
+# ---------- Default parameters ----------
+params = {
+    "doc_name": "FillCylinderOptimized",
+    "seed": 42,
+    "step_path": "",
+    "use_step_as_base": True,
+    "base_radius": 40.0,
+    "base_height": 80.0,
+    "base_center": Vector(0, 0, 0),
+    "n_target": 0,
+    "small_radius": 0.42,
+    "small_length": 1.2,
+    "min_spacing": 0.4,
+    "avoid_overlap": True,
+    "max_overlap": 0.1,
+    "max_attempts": 200000,
+    "vol_tol": 1e-6,
+    "export_dir": os.path.expanduser("~"),
+    "export_prefix": "fill_cyl",
+    "export_separate": True,
+    "stl_binary": True,
+    "use_gui": True,
+    "grid_cell": None,
+    "point_tol": 1e-7,
+}
+# ----------------------------------------
+
+def show_dialog_and_get_params(defaults):
+    if QtGui is None:
+        FreeCAD.Console.PrintMessage("Qt not available; running with defaults.\n")
+        return defaults
+
+    class ParamDialog(QtGui.QDialog):
+        def __init__(self, d):
+            super(ParamDialog, self).__init__()
+            self.setWindowTitle("Fill Cylinder - Parameters (Optimized)")
+            self.d = d.copy()
+            layout = QtGui.QVBoxLayout()
+
+            def add_line(label, key):
+                h = QtGui.QHBoxLayout()
+                h.addWidget(QtGui.QLabel(label))
+                le = QtGui.QLineEdit(str(d[key]))
+                h.addWidget(le)
+                layout.addLayout(h)
+                return le
+
+            self.ed_doc = add_line("Document name:", "doc_name")
+            self.ed_seed = add_line("Random seed:", "seed")
+            self.ed_step = add_line("STEP path (leave empty for cylinder):", "step_path")
+            btn_browse = QtGui.QPushButton("Browse...")
+            def browse():
+                fp, _ = QtGui.QFileDialog.getOpenFileName(self, "Select STEP file", os.path.expanduser("~"), "STEP Files (*.step *.stp);;All Files (*)")
+                if fp:
+                    self.ed_step.setText(fp)
+            btn_browse.clicked.connect(browse)
+            layout.addWidget(btn_browse)
+
+            self.chk_use_step = QtGui.QCheckBox("Use STEP as base (unchecked -> use cylinder)")
+            self.chk_use_step.setChecked(d["use_step_as_base"])
+            layout.addWidget(self.chk_use_step)
+
+            self.ed_n = add_line("Number target small cylinders:", "n_target")
+            self.ed_small_r = add_line("Small radius:", "small_radius")
+            self.ed_small_l = add_line("Small length:", "small_length")
+            self.ed_spacing = add_line("Min center spacing:", "min_spacing")
+            self.ed_max_overlap = add_line("Allowed overlap (units):", "max_overlap")
+            self.ed_maxatt = add_line("Max sampling attempts:", "max_attempts")
+            self.ed_export_dir = add_line("Export directory:", "export_dir")
+
+            self.chk_overlap = QtGui.QCheckBox("Avoid physical overlap (use allowance)")
+            self.chk_overlap.setChecked(d["avoid_overlap"])
+            self.chk_sep = QtGui.QCheckBox("Export separate STL/STEP files (smalls only)")
+            self.chk_sep.setChecked(d["export_separate"])
+            self.chk_bin = QtGui.QCheckBox("STL binary (uncheck for ASCII)")
+            self.chk_bin.setChecked(d["stl_binary"])
+
+            layout.addWidget(self.chk_overlap)
+            layout.addWidget(self.chk_sep)
+            layout.addWidget(self.chk_bin)
+
+            btns = QtGui.QDialogButtonBox(QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+            btns.accepted.connect(self.accept)
+            btns.rejected.connect(self.reject)
+            layout.addWidget(btns)
+            self.setLayout(layout)
+
+            self.inputs = {
+                "doc_name": self.ed_doc, "seed": self.ed_seed, "step_path": self.ed_step,
+                "n_target": self.ed_n, "small_radius": self.ed_small_r, "small_length": self.ed_small_l,
+                "min_spacing": self.ed_spacing, "max_overlap": self.ed_max_overlap,
+                "max_attempts": self.ed_maxatt, "export_dir": self.ed_export_dir
+            }
+
+        def get_values(self):
+            out = {}
+            for k, widget in self.inputs.items():
+                txt = widget.text().strip()
+                if k in ("doc_name", "step_path", "export_dir"):
+                    out[k] = txt
+                else:
+                    try:
+                        if k in ("n_target", "seed", "max_attempts"):
+                            out[k] = int(float(txt))
+                        else:
+                            out[k] = float(txt)
+                    except:
+                        out[k] = defaults[k]
+            out["use_step_as_base"] = self.chk_use_step.isChecked()
+            out["avoid_overlap"] = self.chk_overlap.isChecked()
+            out["export_separate"] = self.chk_sep.isChecked()
+            out["stl_binary"] = self.chk_bin.isChecked()
+            return out
+
+    dlg = ParamDialog(defaults)
+    if dlg.exec_() == QtGui.QDialog.Accepted:
+        vals = dlg.get_values()
+        defaults.update(vals)
+        return defaults
+    else:
+        FreeCAD.Console.PrintMessage("User cancelled. Running with defaults.\n")
+        return defaults
+
+# Launch GUI to edit parameters if requested
+if params["use_gui"] and QtGui is not None:
+    params = show_dialog_and_get_params(params)
+
+random.seed(int(params["seed"]))
+
+if params["grid_cell"] is None:
+    params["grid_cell"] = max( (params["small_length"] + params["small_radius"]) * 1.4, params["min_spacing"] )
+
+# Prepare document
+if FreeCAD.ActiveDocument is None or FreeCAD.ActiveDocument.Name != params["doc_name"]:
+    doc = FreeCAD.newDocument(params["doc_name"])
+else:
+    doc = FreeCAD.ActiveDocument
+
+# Import STEP or create base cylinder
+base_obj = None
+base_shape = None
+if params["use_step_as_base"] and params["step_path"].strip() != "":
+    step_path = params["step_path"]
+    if os.path.isfile(step_path):
+        try:
+            import Import
+            Import.open(step_path)
+            cand = None
+            for obj in FreeCAD.ActiveDocument.Objects[::-1]:
+                if hasattr(obj, "Shape") and not obj.Shape.isNull():
+                    if len(obj.Shape.Solids) > 0:
+                        cand = obj
+                        break
+                    if cand is None:
+                        cand = obj
+            if cand is None:
+                raise RuntimeError("No suitable shape in imported STEP.")
+            base_obj = cand
+            base_shape = base_obj.Shape
+            FreeCAD.Console.PrintMessage("Imported STEP and using object: %s\n" % base_obj.Name)
+        except Exception as e:
+            FreeCAD.Console.PrintMessage("Failed importing STEP (%s). Using fallback cylinder.\n" % str(e))
+
+if base_shape is None:
+    base_name = "BaseCyl"
+    base_obj = doc.getObject(base_name)
+    if base_obj is None:
+        base_obj = doc.addObject("Part::Cylinder", base_name)
+        base_obj.Radius = params["base_radius"]
+        base_obj.Height = params["base_height"]
+        base_obj.Placement = FreeCAD.Placement(Vector(params["base_center"].x, params["base_center"].y, params["base_center"].z - params["base_height"]/2.0),
+                                              FreeCAD.Rotation(0,0,0,1))
+        doc.recompute()
+    base_shape = base_obj.Shape
+    FreeCAD.Console.PrintMessage("Using generated base cylinder: %s\n" % base_obj.Name)
+
+bb = base_shape.BoundBox
+bb_min = Vector(bb.XMin, bb.YMin, bb.ZMin)
+bb_max = Vector(bb.XMax, bb.YMax, bb.ZMax)
+
+# Spatial grid
+class SpatialGrid:
+    def __init__(self, cell):
+        self.cell = float(cell)
+        self.cells = {}
+        self.points = []
+        self.info = []
+    def _key(self, p):
+        return (int(math.floor(p.x / self.cell)), int(math.floor(p.y / self.cell)), int(math.floor(p.z / self.cell)))
+    def insert(self, p, meta):
+        k = self._key(p)
+        self.points.append(p)
+        self.info.append(meta)
+        self.cells.setdefault(k, []).append(len(self.points)-1)
+        return len(self.points)-1
+    def nearby_indices(self, p, radius):
+        rcell = int(math.ceil(radius / self.cell))
+        k = self._key(p)
+        res = []
+        for dx in range(-rcell, rcell+1):
+            for dy in range(-rcell, rcell+1):
+                for dz in range(-rcell, rcell+1):
+                    ck = (k[0]+dx, k[1]+dy, k[2]+dz)
+                    if ck in self.cells:
+                        res.extend(self.cells[ck])
+        return res
+
+def segment_segment_distance(p1, q1, p2, q2):
+    SMALL_NUM = 1e-12
+    u = q1 - p1
+    v = q2 - p2
+    w0 = p1 - p2
+    a = u.dot(u)
+    b = u.dot(v)
+    c = v.dot(v)
+    d = u.dot(w0)
+    e = v.dot(w0)
+    D = a*c - b*b
+    sN = D; tN = D; sD = D; tD = D
+    if D < SMALL_NUM:
+        sN = 0.0; sD = 1.0; tN = e; tD = c
+    else:
+        sN = (b*e - c*d); tN = (a*e - b*d)
+        if sN < 0.0:
+            sN = 0.0; tN = e; tD = c
+        elif sN > sD:
+            sN = sD; tN = e + b; tD = c
+    if tN < 0.0:
+        tN = 0.0
+        if -d < 0.0:
+            sN = 0.0
+        elif -d > a:
+            sN = sD
+        else:
+            sN = -d; sD = a
+    elif tN > tD:
+        tN = tD
+        if (-d + b) < 0.0:
+            sN = 0
+        elif (-d + b) > a:
+            sN = sD
+        else:
+            sN = (-d + b); sD = a
+    sc = 0.0 if abs(sN) < SMALL_NUM else sN / sD
+    tc = 0.0 if abs(tN) < SMALL_NUM else tN / tD
+    dP = w0 + (u.multiply(sc)) - (v.multiply(tc))
+    return math.sqrt(dP.dot(dP))
+
+def sample_point_in_shape(bmin, bmax, shape, tol):
+    for _ in range(100):
+        x = random.uniform(bmin.x, bmax.x)
+        y = random.uniform(bmin.y, bmax.y)
+        z = random.uniform(bmin.z, bmax.z)
+        p = Vector(x,y,z)
+        try:
+            if shape.isInside(p, tol, True):
+                return p
+        except Exception:
+            v = Part.Vertex(p)
+            try:
+                if not shape.common(v).Shape.isNull():
+                    return p
+            except Exception:
+                pass
+    return None
+
+# Stricter containment: boolean volume check, endcap sampling, denser surface sampling
+def is_cylinder_fully_inside(base_shape, cyl, p_seg, q_seg, axis, radius, half_len, vol_tol, point_tol,
+                             n_axial=11, n_azimuth=36, n_endcap_radial=4):
+    # 1) try boolean intersection/volume test
+    try:
+        inter = base_shape.common(cyl)
+        if not inter.isNull():
+            try:
+                if (inter.Volume + vol_tol) >= (cyl.Volume - 1e-12):
+                    return True
+                else:
+                    return False
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # prepare perpendicular vectors
+    try:
+        axis_n = axis.normalize()
+    except Exception:
+        axis_n = axis
+    ref = Vector(0,0,1)
+    if abs(axis_n.z) > 0.99999:
+        ref = Vector(0,1,0)
+    perp = axis.cross(ref)
+    plen = perp.Length
+    if plen < 1e-9:
+        ref = Vector(1,0,0)
+        perp = axis.cross(ref)
+        plen = perp.Length
+        if plen < 1e-9:
+            return False
+    perp = perp.multiply(1.0 / plen)
+    perp2 = axis.cross(perp)
+    plen2 = perp2.Length
+    if plen2 < 1e-9:
+        return False
+    perp2 = perp2.multiply(1.0 / plen2)
+
+    def point_inside(p):
+        try:
+            if not base_shape.common(Part.Vertex(p)).Shape.isNull():
+                return True
+            else:
+                return False
+        except Exception:
+            try:
+                return bool(base_shape.isInside(p, point_tol, True))
+            except Exception:
+                return False
+
+    for ia in range(n_axial):
+        t = float(ia) / max(1, n_axial-1)
+        center = p_seg + (q_seg - p_seg).multiply(t)
+        if not point_inside(center):
+            return False
+        for ja in range(n_azimuth):
+            ang = 2.0 * math.pi * (float(ja) / n_azimuth)
+            offset = perp.multiply(math.cos(ang)*radius) + perp2.multiply(math.sin(ang)*radius)
+            sample_p = center + offset
+            if not point_inside(sample_p):
+                return False
+
+    for end_center in (p_seg, q_seg):
+        for ir in range(n_endcap_radial+1):
+            r = (float(ir) / max(1, n_endcap_radial)) * radius
+            if r < 1e-12:
+                continue
+            for ja in range(n_azimuth):
+                ang = 2.0 * math.pi * (float(ja) / n_azimuth)
+                offset = perp.multiply(math.cos(ang)*r) + perp2.multiply(math.sin(ang)*r)
+                sample_p = end_center + offset
+                if not point_inside(sample_p):
+                    return False
+
+    return True
+
+# Prepare optimized sampling
+grid = SpatialGrid(params["grid_cell"])
+kept_shapes = []
+kept_centers = []
+kept_meta = []
+
+attempts = accepted = rejected_space = rejected_geo = rejected_containment = 0
+startt = time.time()
+FreeCAD.Console.PrintMessage("Optimized sampling start...\n")
+
+N_STAGNANT = 20000
+stagnant = 0
+hard_cap = int(params.get("n_target", 0)) if params.get("n_target", 0) > 0 else None
+
+# Sampling loop
+while attempts < params["max_attempts"] and (hard_cap is None or accepted < hard_cap) and stagnant < N_STAGNANT:
+    attempts += 1
+    pos = sample_point_in_shape(bb_min, bb_max, base_shape, params["point_tol"])
+    if pos is None:
+        stagnant += 1
+        continue
+
+    # quick center spacing
+    nearby = grid.nearby_indices(pos, params["min_spacing"])
+    too_close = False
+    for idx in nearby:
+        other_center = grid.points[idx]
+        v = pos - other_center
+        if v.dot(v) <= params["min_spacing"] * params["min_spacing"]:
+            too_close = True
+            break
+    if too_close:
+        rejected_space += 1
+        stagnant += 1
+        continue
+
+    # random orientation
+    u1 = random.random(); u2 = random.random()
+    theta = 2.0 * math.pi * u1
+    phi = math.acos(2.0 * u2 - 1.0)
+    ux = math.sin(phi) * math.cos(theta)
+    uy = math.sin(phi) * math.sin(theta)
+    uz = math.cos(phi)
+    axis = Vector(ux, uy, uz)
+
+    half_len = params["small_length"] * 0.5
+    p_seg = pos - axis.multiply(half_len)
+    q_seg = pos + axis.multiply(half_len)
+
+    # geometry overlap cheap check
+    if params["avoid_overlap"]:
+        search_rad = params["small_length"] + params["small_radius"] + params["min_spacing"]
+        nb = grid.nearby_indices(pos, search_rad)
+        overlap_found = False
+        for idx in nb:
+            other_meta = grid.info[idx]
+            other_center = grid.points[idx]
+            other_axis = other_meta["axis"]
+            other_half = other_meta["half_len"]
+            other_p = other_center - other_axis.multiply(other_half)
+            other_q = other_center + other_axis.multiply(other_half)
+            dist = segment_segment_distance(p_seg, q_seg, other_p, other_q)
+            rsum = params["small_radius"] + other_meta["radius"]
+            penetration = rsum - dist
+            if penetration > params["max_overlap"]:
+                overlap_found = True
+                break
+        if overlap_found:
+            rejected_geo += 1
+            stagnant += 1
+            continue
+
+    # Cheap containment test: endpoints
+    try:
+        end_inside = base_shape.isInside(p_seg, params["point_tol"], True) and base_shape.isInside(q_seg, params["point_tol"], True)
+    except Exception:
+        try:
+            v1 = Part.Vertex(p_seg); v2 = Part.Vertex(q_seg)
+            end_inside = (not base_shape.common(v1).Shape.isNull()) and (not base_shape.common(v2).Shape.isNull())
+        except Exception:
+            end_inside = False
+
+    contained = False
+    cyl = None
+    if end_inside:
+        cyl = Part.makeCylinder(params["small_radius"], params["small_length"])
+        rot = FreeCAD.Rotation(Vector(0,0,1), axis)
+        base_pos = pos - axis.multiply(half_len)
+        cyl.Placement = FreeCAD.Placement(base_pos, rot)
+        try:
+            contained = is_cylinder_fully_inside(base_shape, cyl, p_seg, q_seg, axis,
+                                                 params["small_radius"], half_len,
+                                                 params["vol_tol"], params["point_tol"],
+                                                 n_axial=9, n_azimuth=24, n_endcap_radial=4)
+        except Exception:
+            contained = False
+    else:
+        cyl = Part.makeCylinder(params["small_radius"], params["small_length"])
+        rot = FreeCAD.Rotation(Vector(0,0,1), axis)
+        base_pos = pos - axis.multiply(half_len)
+        cyl.Placement = FreeCAD.Placement(base_pos, rot)
+        try:
+            contained = is_cylinder_fully_inside(base_shape, cyl, p_seg, q_seg, axis,
+                                                 params["small_radius"], half_len,
+                                                 params["vol_tol"], params["point_tol"],
+                                                 n_axial=11, n_azimuth=36, n_endcap_radial=6)
+        except Exception:
+            contained = False
+
+    # Final acceptance with an extra strict boolean check
+    if contained:
+        try:
+            inter_final = base_shape.common(cyl)
+            if inter_final.isNull():
+                final_ok = False
+            else:
+                try:
+                    final_ok = (inter_final.Volume + params["vol_tol"]) >= (cyl.Volume - 1e-12)
+                except Exception:
+                    final_ok = is_cylinder_fully_inside(base_shape, cyl, p_seg, q_seg, axis,
+                                                        params["small_radius"], half_len,
+                                                        params["vol_tol"], params["point_tol"],
+                                                        n_axial=13, n_azimuth=48, n_endcap_radial=6)
+        except Exception:
+            final_ok = is_cylinder_fully_inside(base_shape, cyl, p_seg, q_seg, axis,
+                                                params["small_radius"], half_len,
+                                                params["vol_tol"], params["point_tol"],
+                                                n_axial=13, n_azimuth=48, n_endcap_radial=6)
+
+        if not final_ok:
+            rejected_containment += 1
+            stagnant += 1
+        else:
+            meta = {"radius": params["small_radius"], "half_len": half_len, "axis": axis, "center": pos}
+            grid.insert(pos, meta)
+            kept_centers.append(pos)
+            kept_meta.append(meta)
+            accepted += 1
+            stagnant = 0
+            if cyl is None:
+                cyl = Part.makeCylinder(params["small_radius"], params["small_length"])
+                rot = FreeCAD.Rotation(Vector(0,0,1), axis)
+                base_pos = pos - axis.multiply(half_len)
+                cyl.Placement = FreeCAD.Placement(base_pos, rot)
+            kept_shapes.append(cyl)
+    else:
+        rejected_containment += 1
+        stagnant += 1
+
+    if attempts % 5000 == 0:
+        FreeCAD.Console.PrintMessage("attempts=%d accepted=%d rej_space=%d rej_geo=%d rej_cont=%d stagnant=%d\n" %
+            (attempts, accepted, rejected_space, rejected_geo, rejected_containment, stagnant))
+
+# End sampling
+endt = time.time()
+FreeCAD.Console.PrintMessage("Sampling done: attempts=%d accepted=%d time=%.1fs stagnant=%d\n" % (attempts, accepted, endt-startt, stagnant))
+FreeCAD.Console.PrintMessage("Rejected (spacing)=%d (geom)=%d (contain)=%d\n" % (rejected_space, rejected_geo, rejected_containment))
+
+# Disable GUI updates if possible
+gui_was_disabled = False
+if FreeCADGui is not None:
+    try:
+        win = FreeCADGui.getMainWindow()
+        win.setUpdatesEnabled(False)
+        gui_was_disabled = True
+    except Exception:
+        try:
+            FreeCADGui.updateGui(False)
+            gui_was_disabled = True
+        except Exception:
+            gui_was_disabled = False
+
+# NOTE: No boolean base_cut created per request.
+
+# Re-enable GUI updates
+if gui_was_disabled and FreeCADGui is not None:
+    try:
+        win.setUpdatesEnabled(True)
+    except Exception:
+        try:
+            FreeCADGui.updateGui(True)
+        except Exception:
+            pass
+
+# Exporting (STL + robust STEP export)
+export_dir = params["export_dir"]
+prefix = params["export_prefix"]
+if not os.path.isdir(export_dir):
+    os.makedirs(export_dir, exist_ok=True)
+
+def export_stl(objects, filepath):
+    Mesh.export(objects, filepath)
+
+def export_step(objs_or_shapes, filepath):
+    # Ensure we have doc objects to export; create temporary Part::Feature for raw shapes
+    doc_objs = []
+    temp_objs = []
+    for item in objs_or_shapes:
+        if hasattr(item, "Shape"):
+            doc_objs.append(item)
+        else:
+            # assume it's a Part.Shape -> create temporary feature
+            name = "TmpExportShape_%08d" % len(temp_objs)
+            to = doc.addObject("Part::Feature", name)
+            to.Shape = item
+            temp_objs.append(to)
+            doc_objs.append(to)
+    doc.recompute()
+    try:
+        Part.export(doc_objs, filepath)
+    finally:
+        for to in temp_objs:
+            try:
+                doc.removeObject(to.Name)
+            except Exception:
+                pass
+        if temp_objs:
+            doc.recompute()
+
+# If user requested separate export, export small cylinders as both STL and STEP.
+if params["export_separate"] and accepted > 0:
+    small_objs = []
+    for i, s in enumerate(kept_shapes, start=1):
+        name = "TmpSmall_{:06d}".format(i)
+        o = doc.addObject("Part::Feature", name)
+        o.Shape = s
+        small_objs.append(o)
+    doc.recompute()
+    out_smalls_stl = os.path.join(export_dir, f"{prefix}_smalls.stl")
+    export_stl(small_objs, out_smalls_stl)
+    FreeCAD.Console.PrintMessage("Exported: %s\n" % out_smalls_stl)
+    out_smalls_step = os.path.join(export_dir, f"{prefix}_smalls.step")
+    export_step(small_objs, out_smalls_step)
+    FreeCAD.Console.PrintMessage("Exported: %s\n" % out_smalls_step)
+    for o in small_objs:
+        doc.removeObject(o.Name)
+    doc.recompute()
+else:
+    # Single export: export the original base (un-cut) as both STL and STEP
+    objs = [base_obj]
+    out_single_stl = os.path.join(export_dir, f"{prefix}_result.stl")
+    export_stl(objs, out_single_stl)
+    FreeCAD.Console.PrintMessage("Exported: %s\n" % out_single_stl)
+    out_single_step = os.path.join(export_dir, f"{prefix}_result.step")
+    export_step(objs, out_single_step)
+    FreeCAD.Console.PrintMessage("Exported: %s\n" % out_single_step)
+
+FreeCAD.Console.PrintMessage("Done.\n")
